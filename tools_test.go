@@ -188,3 +188,53 @@ func TestToolsPreamble(t *testing.T) {
 		t.Fatalf("preamble: %q", pre)
 	}
 }
+
+func TestToSnakeCase(t *testing.T) {
+	cases := map[string]string{
+		"Bash":          "bash",
+		"ReadFile":      "read_file",
+		"WebFetch":      "web_fetch",
+		"TodoWrite":     "todo_write",
+		"XMLParser":     "xml_parser",
+		"already_snake": "already_snake",
+		"kebab-case":    "kebab_case",
+	}
+	for in, want := range cases {
+		if got := toSnakeCase(in); got != want {
+			t.Errorf("toSnakeCase(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNameIndexNormalize(t *testing.T) {
+	var td1, td2, td3 toolDef
+	td1.Function.Name = "Bash"
+	td2.Function.Name = "ReadFile"
+	td3.Function.Name = "WebFetch"
+	idx := buildNameIndex([]toolDef{td1, td2, td3})
+
+	cases := map[string]string{
+		"Bash":        "Bash", // exact
+		"bash":        "Bash", // lowercase -> declared
+		"BASh":        "Bash", // lower fallback
+		"read_file":   "ReadFile",
+		"readFile":    "ReadFile",
+		"read-file":   "ReadFile",
+		"readfile":    "ReadFile",
+		"webfetch":    "WebFetch",
+		"web_fetch":   "WebFetch",
+		"UnknownTool": "UnknownTool", // untouched
+	}
+	for in, want := range cases {
+		if got := idx.normalize(in); got != want {
+			t.Errorf("normalize(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNameIndexEmpty(t *testing.T) {
+	idx := buildNameIndex(nil)
+	if got := idx.normalize("bash"); got != "bash" {
+		t.Errorf("empty index should pass through, got %q", got)
+	}
+}

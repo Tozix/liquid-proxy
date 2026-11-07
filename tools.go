@@ -71,9 +71,87 @@ func toolsPreamble(tools []toolDef) (string, error) {
 	b.WriteString(string(schema))
 	b.WriteString("\n\nTo call one, output exactly (special tokens included):\n")
 	b.WriteString(tcStart + "[tool_name(param='value', flag=true)]" + tcEnd + "\n")
+	b.WriteString("IMPORTANT: tool names are case-sensitive — copy the name EXACTLY as given above ")
+	b.WriteString("(e.g. if the tool is listed as \"Bash\", call Bash, not bash; if \"ReadFile\", not read_file).\n")
 	b.WriteString("Multiple calls are allowed in one reply. Arguments use Python literals: strings in quotes, numbers, true/false, None, lists, dicts.\n")
 	b.WriteString("After you receive the tool result you may answer the user or call more tools. Do not invent results.\n")
 	return b.String(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Tool name normalization (models often lowercase or snake_case tool names)
+
+// nameIndex maps every plausible spelling of a declared tool name onto the
+// exact name the client registered, so a call never fails with "tool not found".
+type nameIndex map[string]string
+
+func buildNameIndex(tools []toolDef) nameIndex {
+	idx := nameIndex{}
+	for _, t := range tools {
+		exact := t.Function.Name
+		if exact == "" {
+			continue
+		}
+		for _, variant := range nameVariants(exact) {
+			if _, taken := idx[variant]; !taken {
+				idx[variant] = exact
+			}
+		}
+	}
+	return idx
+}
+
+// nameVariants produces the spellings we accept for one declared name:
+// the exact name, lowercased, snake_cased, kebab-cased, and unseparated.
+func nameVariants(name string) []string {
+	base := []string{name, strings.ToLower(name)}
+	snake := toSnakeCase(name)
+	kebab := strings.ReplaceAll(snake, "_", "-")
+	bare := strings.ReplaceAll(snake, "_", "")
+	return append(base, snake, kebab, bare)
+}
+
+// toSnakeCase converts CamelCase / PascalCase to snake_case.
+func toSnakeCase(s string) string {
+	var b strings.Builder
+	runes := []rune(s)
+	for i, r := range runes {
+		if unicode.IsUpper(r) {
+			if i > 0 {
+				prev := runes[i-1]
+				nextLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+				if unicode.IsLower(prev) || unicode.IsDigit(prev) || (unicode.IsUpper(prev) && nextLower) {
+					b.WriteRune('_')
+				}
+			}
+			b.WriteRune(unicode.ToLower(r))
+			continue
+		}
+		if r == '-' || r == ' ' {
+			b.WriteRune('_')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// normalize resolves a model-emitted name to the declared one, if possible.
+func (idx nameIndex) normalize(emitted string) string {
+	if len(idx) == 0 {
+		return emitted
+	}
+	if exact, ok := idx[emitted]; ok {
+		return exact
+	}
+	lower := strings.ToLower(strings.TrimSpace(emitted))
+	if exact, ok := idx[lower]; ok {
+		return exact
+	}
+	if exact, ok := idx[toSnakeCase(emitted)]; ok {
+		return exact
+	}
+	return emitted // unknown: pass through so the client reports it clearly
 }
 
 // ---------------------------------------------------------------------------

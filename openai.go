@@ -890,11 +890,16 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 		TotalTokens:      promptTokens + completionTokens,
 	}
 	if len(toolCallsCollected) > 0 {
+		names := buildNameIndex(req.Tools)
 		entries := make([]map[string]any, 0, len(toolCallsCollected))
 		for i, c := range toolCallsCollected {
+			name := names.normalize(c.Name)
+			if name != c.Name {
+				log.Printf("[tools] normalized %q -> %q", c.Name, name)
+			}
 			entries = append(entries, map[string]any{
 				"index": i, "type": "function", "id": c.ID,
-				"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+				"function": map[string]any{"name": name, "arguments": c.Arguments},
 			})
 		}
 		send(map[string]any{"tool_calls": entries}, nil, nil)
@@ -947,11 +952,16 @@ func (ps *proxyServer) blockToClient(w http.ResponseWriter, r *http.Request,
 	}
 	if len(calls) > 0 {
 		finish = "tool_calls"
+		names := buildNameIndex(req.Tools)
 		entries := make([]map[string]any, 0, len(calls))
 		for i, c := range calls {
+			name := names.normalize(c.Name)
+			if name != c.Name {
+				log.Printf("[tools] normalized %q -> %q", c.Name, name)
+			}
 			entries = append(entries, map[string]any{
 				"id": c.ID, "type": "function", "index": i,
-				"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+				"function": map[string]any{"name": name, "arguments": c.Arguments},
 			})
 		}
 		message["tool_calls"] = entries
