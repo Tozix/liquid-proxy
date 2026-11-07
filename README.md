@@ -83,7 +83,14 @@ print(r.choices[0].message.content)
   (`content`-массив с `image_url`): data URI (`data:image/png;base64,…`) и http(s)-URL (прокси скачает сам).
   Картинка загружается в storage playground'а (presign → S3 PUT, как в вебе) и передаётся через `imageUuids`.
   Не-vision модель с картинкой → 400 с подсказкой. Лимиты: ≤4 картинки на запрос, ≤10 МБ каждая.
-  Tool calling игнорируется, voice-модели не поддержаны.
+  Voice-модели не поддержаны.
+- **Tool calling (function calling)**: `tools` из OpenAI-запроса прокидываются в промпт, нативные
+  вызовы модели (`<|tool_call_start|>[name(arg='v')]<|tool_call_end|>`) парсятся и конвертируются в
+  OpenAI `delta.tool_calls` / `message.tool_calls` с `finish_reason: "tool_calls"` (стрим и non-stream).
+  История `assistant.tool_calls` + `role:"tool"` результаты тоже сериализуются. Аргументы —
+  Python-литералы модели (строки/числа/bool/None/списки/словари) конвертируются в JSON; экзотика
+  уходит как `{"_raw": "..."}`. Работает с OpenAI SDK и агентскими клиентами (проверено циклом
+  tool call → tool result → финальный ответ).
 
 ## Лимиты
 

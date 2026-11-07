@@ -53,18 +53,22 @@ func resolveModel(input string) string {
 // OpenAI wire types
 
 type chatMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	ToolCalls  json.RawMessage `json:"tool_calls"` // assistant messages carrying calls
+	ToolCallID string          `json:"tool_call_id"`
+	Name       string          `json:"name"`
 }
 
 type completionRequest struct {
 	Model         string        `json:"model"`
 	Messages      []chatMessage `json:"messages"`
 	Stream        bool          `json:"stream"`
+	Tools         []toolDef     `json:"tools"`
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
-	// Tool/function calling and sampling parameters are accepted but ignored.
+	// tool_choice and sampling parameters are accepted but ignored.
 }
 
 // imagePart is one decoded image awaiting upload to the playground.
@@ -182,22 +186,70 @@ func isVisionSlug(slug string) bool {
 	return strings.Contains(slug, "-vl-")
 }
 
-// serializeMessages folds an OpenAI conversation into one upstream prompt and
-// collects all referenced images.
-func serializeMessages(msgs []chatMessage) (string, []imagePart, error) {
+// serializeAssistantToolCalls renders assistant tool_calls from history back
+// into the model's native call syntax.
+func serializeAssistantToolCalls(raw json.RawMessage) string {
+	var calls []struct {
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(raw, &calls); err != nil || len(calls) == 0 {
+		return ""
+	}
 	var b strings.Builder
+	for _, c := range calls {
+		if c.Function.Name == "" {
+			continue
+		}
+		b.WriteString(tcStart + "[" + c.Function.Name + "(" + strings.TrimSpace(c.Function.Arguments) + ")]" + tcEnd)
+	}
+	return b.String()
+}
+
+// serializeMessages folds an OpenAI conversation into one upstream prompt and
+// collects all referenced images. Tool definitions become a prompt preamble
+// in the model's trained tool-calling format.
+func serializeMessages(msgs []chatMessage, tools []toolDef) (string, []imagePart, error) {
+	var pre strings.Builder
 	var images []imagePart
+
+	// system/developer messages + tools preamble first
+	for _, m := range msgs {
+		if m.Role != "system" && m.Role != "developer" {
+			continue
+		}
+		text, _, err := extractContent(m.Content)
+		if err != nil {
+			return "", nil, fmt.Errorf("system message: %w", err)
+		}
+		pre.WriteString(text + "\n\n")
+	}
+	if len(tools) > 0 {
+		preamble, err := toolsPreamble(tools)
+		if err != nil {
+			return "", nil, fmt.Errorf("tools: %w", err)
+		}
+		pre.WriteString(preamble + "\n\n")
+	}
+
+	var b strings.Builder
 	for i, m := range msgs {
+		if m.Role == "system" || m.Role == "developer" {
+			continue
+		}
 		text, imgs, err := extractContent(m.Content)
 		if err != nil {
 			return "", nil, fmt.Errorf("message %d: %w", i, err)
 		}
 		images = append(images, imgs...)
 		switch m.Role {
-		case "system", "developer":
-			b.WriteString(text)
 		case "assistant":
 			b.WriteString("Assistant: " + text)
+			if native := serializeAssistantToolCalls(m.ToolCalls); native != "" {
+				b.WriteString(native)
+			}
 		case "tool", "function":
 			b.WriteString("Tool result: " + text)
 		default: // user and anything else
@@ -205,7 +257,8 @@ func serializeMessages(msgs []chatMessage) (string, []imagePart, error) {
 		}
 		b.WriteString("\n\n")
 	}
-	return strings.TrimRight(b.String(), "\n"), images, nil
+	out := strings.TrimRight(pre.String()+b.String(), "\n")
+	return out, images, nil
 }
 
 func newID(prefix string) string {
@@ -279,7 +332,7 @@ func (ps *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "messages must not be empty")
 		return
 	}
-	prompt, images, err := serializeMessages(req.Messages)
+	prompt, images, err := serializeMessages(req.Messages, req.Tools)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -514,6 +567,9 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 	var raw strings.Builder
 	seenText := false
 	splitter := NewThinkSplitter()
+	toolFlt := NewToolCallFilter()
+	var toolCallsCollected []ToolCall
+	finishReason := "stop"
 
 	writeHeaders := func() {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -565,8 +621,10 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 			}
 			rea, con := splitter.Feed(chunk)
 			if !committed {
+				clean, calls := toolFlt.Feed(con)
+				toolCallsCollected = append(toolCallsCollected, calls...)
 				bufRea.WriteString(rea)
-				bufCon.WriteString(con)
+				bufCon.WriteString(clean)
 				if seenText {
 					commit()
 					if bufRea.Len() > 0 {
@@ -584,7 +642,11 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 				send(map[string]any{"reasoning_content": rea}, nil, nil)
 			}
 			if con != "" {
-				send(map[string]any{"content": con}, nil, nil)
+				clean, calls := toolFlt.Feed(con)
+				toolCallsCollected = append(toolCallsCollected, calls...)
+				if clean != "" {
+					send(map[string]any{"content": clean}, nil, nil)
+				}
 			}
 			return nil
 		},
@@ -595,6 +657,11 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 
 	// flush splitter tail into the right place (buffered or live)
 	tailRea, tailCon := splitter.Finish()
+	tailClean, tailCalls := toolFlt.Feed(tailCon)
+	tailClean2, finishCalls := toolFlt.Finish()
+	toolCallsCollected = append(toolCallsCollected, tailCalls...)
+	toolCallsCollected = append(toolCallsCollected, finishCalls...)
+	tailCon = tailClean + tailClean2
 	if !committed {
 		bufRea.WriteString(tailRea)
 		bufCon.WriteString(tailCon)
@@ -648,7 +715,18 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 		CompletionTokens: completionTokens,
 		TotalTokens:      promptTokens + completionTokens,
 	}
-	send(map[string]any{}, "stop", nil)
+	if len(toolCallsCollected) > 0 {
+		entries := make([]map[string]any, 0, len(toolCallsCollected))
+		for i, c := range toolCallsCollected {
+			entries = append(entries, map[string]any{
+				"index": i, "type": "function", "id": c.ID,
+				"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+			})
+		}
+		send(map[string]any{"tool_calls": entries}, nil, nil)
+		finishReason = "tool_calls"
+	}
+	send(map[string]any{}, finishReason, nil)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		send(nil, nil, usage)
 	}
@@ -679,9 +757,25 @@ func (ps *proxyServer) blockToClient(w http.ResponseWriter, r *http.Request,
 		raw = res.raw.String()
 	}
 	reasoning, content := splitThinkFull(raw)
+	content, calls := extractToolCalls(content)
+	finish := "stop"
 	message := map[string]any{"role": "assistant", "content": content}
 	if reasoning != "" {
 		message["reasoning_content"] = reasoning
+	}
+	if len(calls) > 0 {
+		finish = "tool_calls"
+		entries := make([]map[string]any, 0, len(calls))
+		for i, c := range calls {
+			entries = append(entries, map[string]any{
+				"id": c.ID, "type": "function", "index": i,
+				"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+			})
+		}
+		message["tool_calls"] = entries
+		if strings.TrimSpace(content) == "" {
+			message["content"] = nil
+		}
 	}
 	completionTokens := estTokens(raw)
 	modelOut := req.Model
@@ -696,7 +790,7 @@ func (ps *proxyServer) blockToClient(w http.ResponseWriter, r *http.Request,
 		"choices": []any{map[string]any{
 			"index":         0,
 			"message":       message,
-			"finish_reason": "stop",
+			"finish_reason": finish,
 		}},
 		"usage": usageInfo{
 			PromptTokens:     promptTokens,

@@ -144,7 +144,7 @@ func TestSerializeMessages(t *testing.T) {
 		{Role: "assistant", Content: jsonRaw("Hello!")},
 		{Role: "user", Content: jsonRaw("How are you?")},
 	}
-	got, _, err := serializeMessages(msgs)
+	got, _, err := serializeMessages(msgs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
