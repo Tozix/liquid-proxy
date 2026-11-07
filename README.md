@@ -120,6 +120,26 @@ rate-limit заголовков у upstream нет.
 - vision: red/blue PNG через data URI → «Red»/«Blue» (обе VL-модели), http URL → «Blue»,
   text-модель с картинкой → 400 с подсказкой
 
+## Сервис на macOS (launchd)
+
+Чтобы прокси жил фоном, стартовал при входе в систему и перезапускался после падений:
+
+```bash
+go build -o liquid-proxy .   # бинарник должен лежать по пути из plist
+```
+
+Создай `~/Library/LaunchAgents/com.tozix.liquid-proxy.plist` (подставь свои пути — `ProgramArguments`
+указывает на бинарник, env-переменные настраиваются в блоке `EnvironmentVariables`), затем:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tozix.liquid-proxy.plist   # установить+запустить
+launchctl kickstart -k gui/$(id -u)/com.tozix.liquid-proxy                              # перезапустить (после go build)
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tozix.liquid-proxy.plist      # остановить и снять
+rm ~/Library/LaunchAgents/com.tozix.liquid-proxy.plist                                  # удалить совсем
+```
+
+`RunAtLoad` — старт при логине, `KeepAlive` — автоперезапуск при падении, логи — в `StandardOutPath`.
+
 ## Дисклеймер
 
 Автоматизация playground идёт вразрез с ToS Liquid AI; это инструмент для личного
