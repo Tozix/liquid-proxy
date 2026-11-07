@@ -13,6 +13,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"unicode"
 )
@@ -151,7 +152,30 @@ func (idx nameIndex) normalize(emitted string) string {
 	if exact, ok := idx[toSnakeCase(emitted)]; ok {
 		return exact
 	}
-	return emitted // unknown: pass through so the client reports it clearly
+	// last resort: suffix/prefix tolerant match (read_file -> read)
+	snake := toSnakeCase(emitted)
+	for variant, exact := range idx {
+		if len(variant) >= 3 && (strings.HasSuffix(snake, variant) || strings.HasPrefix(snake, variant)) {
+			log.Printf("[tools] fuzzy-matched %q -> %q", emitted, exact)
+			return exact
+		}
+	}
+	// unknown: pass through so the client reports it, but leave a trace
+	log.Printf("[tools] WARNING unknown tool name %q (declared: %v)", emitted, idx.declaredNames())
+	return emitted
+}
+
+// declaredNames lists the original (non-normalized) tool names for logging.
+func (idx nameIndex) declaredNames() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, exact := range idx {
+		if !seen[exact] {
+			seen[exact] = true
+			out = append(out, exact)
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -317,8 +341,24 @@ func (p *pyScanner) readValue() (any, error) {
 	}
 }
 
-// parsePyArgs parses "k1=v1, k2='v2'" into a JSON object string.
+// parsePyArgs parses "k1=v1, k2='v2'" into a JSON object string. A bare
+// object literal — "{...}" or "{'k': 'v'}" — is accepted too: models often
+// emit JSON-style arguments although the native format is Python kwargs.
 func parsePyArgs(s string) (string, error) {
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "{") {
+		p := &pyScanner{s: []rune(trimmed)}
+		v, err := p.readValue()
+		if err == nil {
+			if obj, ok := v.(map[string]any); ok {
+				out, merr := json.Marshal(obj)
+				if merr == nil {
+					return string(out), nil
+				}
+			}
+		}
+		// fall through to kwargs parsing for malformed literals
+	}
 	p := &pyScanner{s: []rune(s)}
 	obj := map[string]any{}
 	first := true

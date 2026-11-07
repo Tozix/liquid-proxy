@@ -238,3 +238,33 @@ func TestNameIndexEmpty(t *testing.T) {
 		t.Errorf("empty index should pass through, got %q", got)
 	}
 }
+
+func TestParsePyArgsJSONObject(t *testing.T) {
+	// models sometimes emit a JSON object instead of Python kwargs
+	for _, in := range []string{
+		`{"file_path": "/tmp/x.go"}`,
+		`{'file_path': '/tmp/x.go'}`,
+	} {
+		out, err := parsePyArgs(in)
+		if err != nil {
+			t.Fatalf("input %q: %v", in, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("input %q -> not JSON: %v (%q)", in, err, out)
+		}
+		if m["file_path"] != "/tmp/x.go" {
+			t.Fatalf("input %q -> %v", in, m)
+		}
+	}
+}
+
+func TestExtractJSONObjectArgs(t *testing.T) {
+	_, calls := extractToolCalls(`<|tool_call_start|>[Read({"file_path":"/a/b.go"})]<|tool_call_end|>`)
+	if len(calls) != 1 || calls[0].Name != "Read" {
+		t.Fatalf("calls: %+v", calls)
+	}
+	if calls[0].Arguments != `{"file_path":"/a/b.go"}` {
+		t.Fatalf("args: %q", calls[0].Arguments)
+	}
+}
