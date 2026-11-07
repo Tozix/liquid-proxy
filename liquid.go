@@ -290,17 +290,22 @@ type streamFinal struct {
 }
 
 // StartChatStream sends the message turn and returns once upstream accepted
-// it (2xx). Auth failures surface here, before any byte of the body is read,
-// so callers can retry cleanly on a fresh session. Close resp.Body after
-// consumeDataStream.
-func (s *Session) StartChatStream(ctx context.Context, base, chatID, modelSlug, content string, imageUuids []string) (*http.Response, error) {
+// it (2xx). parentMessageID chains the turn to an existing server-side chat
+// history (conversation reuse); empty means a new top-level message.
+// Auth failures surface here, before any byte of the body is read, so callers
+// can retry cleanly on a fresh session. Close resp.Body after consumeDataStream.
+func (s *Session) StartChatStream(ctx context.Context, base, chatID, modelSlug, content string, imageUuids []string, parentMessageID string) (*http.Response, error) {
 	if imageUuids == nil {
 		imageUuids = []string{}
+	}
+	var parent any
+	if parentMessageID != "" {
+		parent = parentMessageID
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"content":         content,
 		"modelSlug":       modelSlug,
-		"parentMessageId": nil,
+		"parentMessageId": parent,
 		"addons":          []string{},
 		"mode":            "completion",
 		"imageUuids":      imageUuids,
@@ -349,7 +354,15 @@ func dispatchStreamLine(line string, onText func(string) error, onMeta func(stre
 			return onText(text)
 		}
 	case "2":
-		var meta streamMeta
+		// upstream sends an array: [{"type":"metadata","userMessageId":...}]
+		var metas []streamMeta
+		if err := json.Unmarshal([]byte(payload), &metas); err == nil && len(metas) > 0 {
+			if onMeta != nil {
+				onMeta(metas[0])
+			}
+			return nil
+		}
+		var meta streamMeta // tolerate a bare object for robustness
 		if err := json.Unmarshal([]byte(payload), &meta); err == nil && onMeta != nil {
 			onMeta(meta)
 		}
@@ -455,6 +468,31 @@ func (p *SessionPool) Drop(s *Session) {
 	p.total--
 	p.cond.Broadcast()
 	p.mu.Unlock()
+}
+
+// FreeSessions snapshots the currently free sessions (for conversation
+// affinity probes; does not check anything out).
+func (p *SessionPool) FreeSessions() []*Session {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]*Session, len(p.free))
+	copy(out, p.free)
+	return out
+}
+
+// AcquireByID checks out the session owned by userID if it is free. Used for
+// conversation reuse: a chat lives inside one anon account, so a continuation
+// must run on the same session.
+func (p *SessionPool) AcquireByID(userID string) (*Session, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, s := range p.free {
+		if s.userID == userID {
+			p.free = append(p.free[:i], p.free[i+1:]...)
+			return s, true
+		}
+	}
+	return nil, false
 }
 
 func maskID(id string) string {

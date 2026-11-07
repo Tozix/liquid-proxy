@@ -308,8 +308,46 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 // Handlers
 
 type proxyServer struct {
-	pool *SessionPool
-	base string
+	pool  *SessionPool
+	base  string
+	reuse bool
+	convs *convCache
+}
+
+type convUpdate struct {
+	ok          bool // reply produced and cacheable
+	replyCanon  string
+	assistantID string
+	userMsgID   string
+}
+
+func (u convUpdate) nextParentID() string {
+	if u.assistantID != "" {
+		return u.assistantID
+	}
+	return u.userMsgID
+}
+
+// serializeDeltaMessage renders one message the same way serializeMessages
+// would inside a full prompt — used as the delta when reusing a server-side
+// conversation.
+func serializeDeltaMessage(m chatMessage) (string, []imagePart, error) {
+	text, imgs, err := extractContent(m.Content)
+	if err != nil {
+		return "", nil, err
+	}
+	switch m.Role {
+	case "assistant":
+		out := "Assistant: " + text
+		if native := serializeAssistantToolCalls(m.ToolCalls); native != "" {
+			out += native
+		}
+		return out, imgs, nil
+	case "tool", "function":
+		return "Tool result: " + text, imgs, nil
+	default:
+		return "User: " + text, imgs, nil
+	}
 }
 
 // handleChatCompletions implements POST /v1/chat/completions.
@@ -356,23 +394,104 @@ func (ps *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 	}
 
 	const maxAttempts = 2
+
+	// canonical message forms for conversation hashing (computed once)
+	canonList := make([]string, len(req.Messages))
+	for i, m := range req.Messages {
+		canonList[i] = makeCanonMessage(m.Role, m.Content, m.ToolCalls, m.ToolCallID)
+	}
+
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		session, err := ps.pool.Acquire(r.Context())
-		if err != nil {
-			writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "no upstream session available: "+err.Error())
-			return
+		var session *Session
+		var entry *convEntry
+		reuse := false
+
+		// conversation affinity: probe free sessions for a known continuation
+		if ps.reuse && len(req.Messages) > 1 {
+			for _, cand := range ps.pool.FreeSessions() {
+				key := foldChain(seedChain(cand.userID), canonList[:len(canonList)-1])
+				if e := ps.convs.get(key); e != nil {
+					if s, ok := ps.pool.AcquireByID(e.userID); ok {
+						session = s
+						entry = e
+						reuse = true
+						break
+					}
+				}
+			}
+		}
+		if session == nil {
+			var aerr error
+			session, aerr = ps.pool.Acquire(r.Context())
+			if aerr != nil {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "no upstream session available: "+aerr.Error())
+				return
+			}
+			if ps.reuse {
+				// the just-acquired session may itself carry this conversation
+				key := foldChain(seedChain(session.userID), canonList[:len(canonList)-1])
+				if e := ps.convs.get(key); e != nil {
+					entry = e
+					reuse = true
+				}
+			}
 		}
 
-		// images: upload via this session before starting the stream
+		seed := seedChain(session.userID)
+		fullKey := foldChain(seed, canonList) // conversation state after this request
+
+		var chatID, parentID string
+		var turnPrompt string
+		var turnImages []imagePart
+
+		if reuse {
+			entry.mu.Lock()
+			chatID = entry.chatID
+			parentID = entry.nextParentID
+			// delta: only the last message — upstream already holds the rest
+			last := req.Messages[len(req.Messages)-1]
+			deltaText, dimgs, derr := serializeDeltaMessage(last)
+			if derr != nil {
+				entry.mu.Unlock()
+				ps.pool.put(session)
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "last message: "+derr.Error())
+				return
+			}
+			turnImages = dimgs
+			turnPrompt = deltaText
+			log.Printf("[conv] reuse chat %s, parent %s, delta %d chars", chatID, parentID, len(deltaText))
+		} else {
+			turnImages = images
+			turnPrompt = prompt
+			cid, cerr := session.createChat(r.Context(), ps.base)
+			if cerr != nil {
+				ps.settle(session, cerr)
+				if isDead(cerr) && attempt < maxAttempts {
+					continue
+				}
+				writeUpstreamError(w, cerr)
+				return
+			}
+			chatID = cid
+		}
+
+		// upload turn images via this session before starting the stream
 		imageUuids := []string{}
 		uploadFailed := false
-		for i, img := range images {
+		for i, img := range turnImages {
 			key, uerr := session.UploadImage(r.Context(), ps.base, img.data, img.mime)
 			if uerr != nil {
 				if isDead(uerr) && attempt < maxAttempts {
 					ps.pool.Drop(session)
+					if reuse {
+						ps.convs.invalidateUser(session.userID)
+						entry.mu.Unlock()
+					}
 					uploadFailed = true
 					break
+				}
+				if reuse {
+					entry.mu.Unlock()
 				}
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", fmt.Sprintf("image %d upload: %v", i, uerr))
 				ps.pool.put(session)
@@ -384,57 +503,104 @@ func (ps *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 			continue
 		}
 
-		chatID, cerr := session.createChat(r.Context(), ps.base)
-		if cerr != nil {
-			ps.settle(session, cerr)
-			if isDead(cerr) && attempt < maxAttempts {
-				continue
-			}
-			writeUpstreamError(w, cerr)
-			return
-		}
-		streamResp, serr := session.StartChatStream(r.Context(), ps.base, chatID, slug, prompt, imageUuids)
+		streamResp, serr := session.StartChatStream(r.Context(), ps.base, chatID, slug, turnPrompt, imageUuids, parentID)
 		if serr != nil {
-			// the chat exists but is useless — remove it before releasing
-			ps.cleanupChat(session, chatID)
-			ps.settle(session, serr)
-			if isDead(serr) && attempt < maxAttempts {
-				continue
+			if reuse {
+				if isDead(serr) {
+					ps.convs.invalidateUser(entry.userID)
+					ps.pool.Drop(session)
+					entry.mu.Unlock()
+					if attempt < maxAttempts {
+						continue
+					}
+				} else {
+					// chat stays as the conversation carrier; surface the error
+					entry.mu.Unlock()
+					ps.pool.put(session)
+					writeUpstreamError(w, serr)
+					return
+				}
+			} else {
+				// the chat exists but is useless — remove it before releasing
+				ps.cleanupChat(session, chatID)
+				ps.settle(session, serr)
+				if isDead(serr) && attempt < maxAttempts {
+					continue
+				}
+				writeUpstreamError(w, serr)
+				return
 			}
-			writeUpstreamError(w, serr)
-			return
 		}
 		// upstream accepted the request; the stream itself may still turn out
 		// empty (known upstream flake) — retryable before any byte is sent
+		var upd convUpdate
 		if req.Stream {
-			if ps.streamToClient(w, r, streamResp, slug, req, promptTokens) {
+			var retryable bool
+			retryable, upd = ps.streamToClient(w, r, streamResp, slug, req, promptTokens)
+			if retryable {
 				if attempt < maxAttempts && r.Context().Err() == nil {
-					log.Printf("[retry] empty stream (chat %s), retrying on a fresh chat", chatID)
-					ps.cleanupChat(session, chatID)
+					log.Printf("[retry] empty stream (chat %s), retrying", chatID)
+					if !reuse {
+						ps.cleanupChat(session, chatID)
+					}
+					if reuse {
+						entry.mu.Unlock()
+					}
 					ps.pool.put(session)
 					continue
 				}
+				if reuse {
+					entry.mu.Unlock()
+				}
 				ps.writeEmptyStreamFallback(w, modelNameFor(req, slug))
-				ps.cleanupChat(session, chatID)
+				if !reuse {
+					ps.cleanupChat(session, chatID)
+				}
 				ps.pool.put(session)
 				return
 			}
 		} else {
-			if ps.blockToClient(w, r, streamResp, slug, req, promptTokens) {
+			var retryable bool
+			retryable, upd = ps.blockToClient(w, r, streamResp, slug, req, promptTokens)
+			if retryable {
 				if attempt < maxAttempts && r.Context().Err() == nil {
-					log.Printf("[retry] empty completion (chat %s), retrying on a fresh chat", chatID)
-					ps.cleanupChat(session, chatID)
+					log.Printf("[retry] empty completion (chat %s), retrying", chatID)
+					if !reuse {
+						ps.cleanupChat(session, chatID)
+					}
+					if reuse {
+						entry.mu.Unlock()
+					}
 					ps.pool.put(session)
 					continue
 				}
+				if reuse {
+					entry.mu.Unlock()
+				}
 				ps.writeEmptyCompletion(w, slug, req, promptTokens)
-				ps.cleanupChat(session, chatID)
+				if !reuse {
+					ps.cleanupChat(session, chatID)
+				}
 				ps.pool.put(session)
 				return
 			}
 		}
-		// the client already has the full response; housekeeping before release
-		ps.cleanupChat(session, chatID)
+
+		// successful exchange: the chat is a conversation carrier now — cache
+		// the new conversation state and keep the chat alive upstream
+		if upd.ok {
+			entry := &convEntry{
+				userID:        session.userID,
+				chatID:        chatID,
+				nextParentID:  upd.nextParentID(),
+				lastMessageID: upd.userMsgID,
+			}
+			ps.convs.put(hashChain(fullKey, upd.replyCanon), entry)
+		}
+		if reuse {
+			entry.mu.Unlock()
+		}
+		// the client already has the full response; session back to the pool
 		ps.pool.put(session)
 		return
 	}
@@ -519,6 +685,7 @@ type streamResult struct {
 	content   strings.Builder
 	raw       strings.Builder
 	final     streamFinal
+	meta      streamMeta
 }
 
 // consumeInto feeds the upstream stream through the splitter, collecting the
@@ -533,7 +700,7 @@ func consumeInto(resp *http.Response, onDelta func(reasoning, content string)) (
 			onDelta(reasoning, content)
 			return nil
 		},
-		func(streamMeta) {},
+		func(m streamMeta) { res.meta = m },
 		func(f streamFinal) { res.final = f },
 	)
 	// flush bytes still buffered in the splitter
@@ -548,13 +715,14 @@ func consumeInto(resp *http.Response, onDelta func(reasoning, content string)) (
 // then retry the whole completion on a fresh chat.
 // Session release and chat cleanup happen in the caller.
 func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
-	resp *http.Response, slug string, req completionRequest, promptTokens int) bool {
+	resp *http.Response, slug string, req completionRequest, promptTokens int) (bool, convUpdate) {
 
+	var upd convUpdate
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		resp.Body.Close()
 		writeOpenAIError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by transport")
-		return false
+		return false, upd
 	}
 
 	modelName := modelNameFor(req, slug)
@@ -569,6 +737,7 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 	splitter := NewThinkSplitter()
 	toolFlt := NewToolCallFilter()
 	var toolCallsCollected []ToolCall
+	var sentContent strings.Builder // exact content text emitted to the client
 	finishReason := "stop"
 
 	writeHeaders := func() {
@@ -599,6 +768,11 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 		if usage != nil {
 			chunk["choices"] = []any{}
 			chunk["usage"] = usage
+		}
+		if delta != nil {
+			if c, ok := delta["content"].(string); ok {
+				sentContent.WriteString(c)
+			}
 		}
 		data, _ := json.Marshal(chunk)
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
@@ -650,7 +824,7 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 			}
 			return nil
 		},
-		func(streamMeta) {},
+		func(m streamMeta) { upd.userMsgID = m.UserMessageID; upd.assistantID = m.AssistantMessageID },
 		func(f streamFinal) { res.final = f },
 	)
 	resp.Body.Close()
@@ -693,7 +867,7 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 		if cerr != nil {
 			log.Printf("[stream] upstream read error before any content: %v", cerr)
 		}
-		return true
+		return true, upd
 	}
 
 	if cerr != nil {
@@ -702,7 +876,7 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 		send(map[string]any{}, "stop", nil)
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
-		return false
+		return false, upd
 	}
 
 	finalText := res.final.FinalContent
@@ -732,7 +906,14 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
-	return false
+
+	var contentPtr *string
+	if emitted := sentContent.String(); emitted != "" {
+		contentPtr = &emitted
+	}
+	upd.ok = true
+	upd.replyCanon = replyCanonical(contentPtr, toolCallsCollected)
+	return false, upd
 }
 
 // blockToClient waits for the full upstream stream and returns one OpenAI
@@ -740,16 +921,17 @@ func (ps *proxyServer) streamToClient(w http.ResponseWriter, r *http.Request,
 // written yet (caller may retry). Session release and chat cleanup happen in
 // the caller.
 func (ps *proxyServer) blockToClient(w http.ResponseWriter, r *http.Request,
-	resp *http.Response, slug string, req completionRequest, promptTokens int) bool {
+	resp *http.Response, slug string, req completionRequest, promptTokens int) (bool, convUpdate) {
 
+	var upd convUpdate
 	res, cerr := consumeInto(resp, func(string, string) {})
 	resp.Body.Close()
 	if cerr != nil {
 		writeUpstreamError(w, cerr)
-		return false
+		return false, upd
 	}
 	if isEmptyStreamResult(res) {
-		return true
+		return true, upd
 	}
 
 	raw := res.final.FinalContent
@@ -803,7 +985,15 @@ func (ps *proxyServer) blockToClient(w http.ResponseWriter, r *http.Request,
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	return false
+	var contentPtr *string
+	if content != "" {
+		contentPtr = &content
+	}
+	upd.ok = true
+	upd.userMsgID = res.meta.UserMessageID
+	upd.assistantID = res.meta.AssistantMessageID
+	upd.replyCanon = replyCanonical(contentPtr, calls)
+	return false, upd
 }
 
 // isEmptyStreamResult reports a transport-level empty stream: upstream closed

@@ -18,6 +18,8 @@ type config struct {
 	base    string
 	maxSess int
 	prewarm int
+	reuse   bool
+	convTTL int
 }
 
 func loadConfig() config {
@@ -27,6 +29,8 @@ func loadConfig() config {
 		base:    strings.TrimRight(getenv("UPSTREAM", "https://playground.liquid.ai"), "/"),
 		maxSess: getenvInt("POOL_MAX", 8),
 		prewarm: getenvInt("PREWARM", 2),
+		reuse:   getenv("REUSE", "1") != "0",
+		convTTL: getenvInt("CONV_TTL_MIN", 60),
 	}
 	if cfg.maxSess < 1 {
 		cfg.maxSess = 1
@@ -76,7 +80,12 @@ func requireAuth(next http.HandlerFunc, apiKey string) http.HandlerFunc {
 func main() {
 	cfg := loadConfig()
 	pool := NewSessionPool(cfg.base, cfg.maxSess)
-	ps := &proxyServer{pool: pool, base: cfg.base}
+	ps := &proxyServer{
+		pool:  pool,
+		base:  cfg.base,
+		reuse: cfg.reuse,
+		convs: newConvCache(256, time.Duration(cfg.convTTL)*time.Minute),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", requireAuth(ps.handleChatCompletions, cfg.apiKey))
@@ -110,8 +119,10 @@ func main() {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	log.Printf("liquid-proxy listening on :%s (upstream %s, pool max %d, auth %s)",
-		cfg.port, cfg.base, cfg.maxSess, map[bool]string{true: "enabled", false: "open"}[cfg.apiKey != ""])
+	log.Printf("liquid-proxy listening on :%s (upstream %s, pool max %d, auth %s, chat reuse %s)",
+		cfg.port, cfg.base, cfg.maxSess,
+		map[bool]string{true: "enabled", false: "open"}[cfg.apiKey != ""],
+		map[bool]string{true: "on", false: "off"}[cfg.reuse])
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server: %v", err)
 	}
